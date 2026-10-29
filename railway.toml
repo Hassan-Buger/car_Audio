@@ -1,0 +1,16 @@
+# Railway deployment configuration for Digisound Car Audio Scraper
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
+healthcheckPath = "/health"
+healthcheckTimeout = 100
+
+# Worker Service Reference
+# To deploy the background worker on Railway, create a second service pointing to the same repository
+# with the following start command:
+# startCommand = "python -m app.worker"
