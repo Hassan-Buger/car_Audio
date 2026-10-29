@@ -139,7 +139,9 @@ class TestSyncEngineIntegration:
         assert run1.new_products > 0
 
         # Get initial timestamps
-        prod_query = select(Product).where(Product.source == "digisound").limit(1)
+        prod_query = (
+            select(Product).where(Product.source == "digisound").order_by(Product.id).limit(1)
+        )
         prod_before = (await db_session.execute(prod_query)).scalar_one()
         content_ts_before = prod_before.content_updated_at
         stock_ts_before = prod_before.stock_updated_at

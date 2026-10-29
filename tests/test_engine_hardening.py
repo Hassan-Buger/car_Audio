@@ -432,6 +432,35 @@ class TestStockRuns:
 
     @pytest.mark.asyncio
     @respx.mock
+    @pytest.mark.parametrize(
+        ("card_text", "expected"),
+        [
+            ("Back order", "backorder"),
+            ("Temporarily out of stock", "out_of_stock"),
+            ("Discontinued product", "out_of_stock"),
+        ],
+    )
+    async def test_listing_card_availability_wins_over_coarse_detail_flag(
+        self, db_session: AsyncSession, card_text: str, expected: str
+    ) -> None:
+        # Live site: the detail page's schema.org availability says "InStock" even for back-order
+        # items while the listing card has the real wording. Discovery and a following stock run
+        # must agree, so no false commerce_updated event appears.
+        item = Item("brax-x", "BRAX X", "4000,00 €", card_text)
+        respx.get(ROOT).mock(return_value=httpx.Response(200, text=listing_html([item], total=1)))
+        respx.get(f"{BASE}{item.url_path}").mock(
+            return_value=httpx.Response(200, text=detail_html(item, stock="In stock"))
+        )
+        await make_engine(db_session).execute_discovery_run()
+        prod = (await db_session.execute(select(Product))).scalar_one()
+        assert prod.stock_status == expected
+        assert prod.availability_text == card_text
+        run = await make_engine(db_session).execute_stock_run()
+        assert (run.updated_products, run.unchanged_products) == (0, 1)
+        assert await count(db_session, ProductChange) == 1  # only the creation
+
+    @pytest.mark.asyncio
+    @respx.mock
     async def test_stock_status_change_is_detected(self, db_session: AsyncSession) -> None:
         mock_catalog([A])
         await make_engine(db_session).execute_discovery_run()

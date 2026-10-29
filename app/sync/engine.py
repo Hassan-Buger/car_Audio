@@ -170,12 +170,17 @@ def build_normalized_product(
     currency = extract_currency(price_raw)
     tax_basis = normalize_tax_basis(detail.price_tax_text)
 
-    stock_text = detail.stock_text or item.stock_text
+    # Availability: the listing card carries the real wording ("In stock", "Back order",
+    # "Temporarily out of stock", "Discontinued product"). The detail page's schema.org
+    # availability is a coarse flag that reports "InStock" even for back-order items, so it is only
+    # a fallback. Using the card in both discovery and stock runs keeps them consistent and avoids
+    # false commerce changes between the two.
+    stock_text = item.stock_text or detail.stock_text
     stock_status = normalize_stock_status(stock_text)
-    stock_quantity = parse_stock_quantity(detail.stock_text)
+    stock_quantity = parse_stock_quantity(item.stock_text)
     if stock_quantity is None:
-        stock_quantity = parse_stock_quantity(item.stock_text)
-    availability_text = detail.availability_text or item.stock_text
+        stock_quantity = parse_stock_quantity(detail.stock_text)
+    availability_text = item.stock_text or detail.availability_text
 
     ean_valid, ean_error = validate_ean(detail.ean_raw)
     raw_images = list(detail.images)
