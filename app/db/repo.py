@@ -5,17 +5,21 @@ import uuid
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.base import utc_now
+from app.db.lock import lock_change_writers
 from app.db.models import (
     Category,
     CategoryProgress,
     Product,
     ProductCategory,
     ProductChange,
+    RequestLog,
     Run,
+    RunCategoryProduct,
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +63,8 @@ class Repository:
             cat.name = name
             cat.slug = slug
             cat.canonical_url = canonical_url
+            if parent_id is not None:
+                cat.parent_id = parent_id
             if ordered_path:
                 cat.ordered_path = ordered_path
             if source_reported_count is not None:
@@ -67,6 +73,11 @@ class Repository:
             await self.session.flush()
 
         return cat
+
+    async def get_category_by_source_id(self, source_id: str) -> Category | None:
+        """Fetch a category by its source id."""
+        query = select(Category).where(Category.source_id == source_id)
+        return (await self.session.execute(query)).scalar_one_or_none()
 
     async def get_all_categories(self) -> list[Category]:
         """Fetch all categories ordered by parent and name."""
@@ -94,9 +105,99 @@ class Repository:
 
     async def get_active_run(self) -> Run | None:
         """Fetch currently running run if any."""
-        query = select(Run).where(Run.status == "running").order_by(Run.started_at.desc())
+        query = select(Run).where(Run.status == "running").order_by(Run.started_at.desc()).limit(1)
         result = await self.session.execute(query)
         return result.scalar_one_or_none()
+
+    async def get_resumable_run(self, run_type: str) -> Run | None:
+        """Most recent interrupted ('running') run of the given type, if any."""
+        query = (
+            select(Run)
+            .where(Run.type == run_type, Run.status == "running")
+            .order_by(Run.started_at.desc())
+            .limit(1)
+        )
+        result = await self.session.execute(query)
+        return result.scalar_one_or_none()
+
+    async def record_request_failure(
+        self,
+        run_id: uuid.UUID | None,
+        url: str,
+        status_code: int | None,
+        error: str,
+    ) -> None:
+        """Persist a failed or suspicious source request for diagnostics."""
+        self.session.add(
+            RequestLog(
+                run_id=run_id,
+                url=url,
+                method="GET",
+                status_code=status_code,
+                error=error[:2000],
+                recorded_at=utc_now(),
+            )
+        )
+        await self.session.flush()
+
+    # ---------------- Run membership (exact per-run, per-category product sets) -------------
+    async def add_run_category_member(
+        self, run_id: uuid.UUID, category_id: int, product_id: int
+    ) -> None:
+        """Record that a product was seen in a category during a run (idempotent)."""
+        stmt = (
+            pg_insert(RunCategoryProduct)
+            .values(run_id=run_id, category_id=category_id, product_id=product_id)
+            .on_conflict_do_nothing()
+        )
+        await self.session.execute(stmt)
+
+    async def count_run_category_members(self, run_id: uuid.UUID, category_id: int) -> int:
+        """Distinct products recorded for a category in a run."""
+        query = select(func.count()).where(
+            RunCategoryProduct.run_id == run_id, RunCategoryProduct.category_id == category_id
+        )
+        return int((await self.session.execute(query)).scalar_one())
+
+    async def get_product(self, source_product_id: str) -> Product | None:
+        """Fetch a digisound product by its supplier product id."""
+        query = select(Product).where(
+            Product.source == "digisound", Product.source_product_id == source_product_id
+        )
+        return (await self.session.execute(query)).scalar_one_or_none()
+
+    async def count_products(self) -> int:
+        """Count digisound products."""
+        query = select(func.count(Product.id)).where(Product.source == "digisound")
+        return int((await self.session.execute(query)).scalar_one())
+
+    # ---------------- Change feed ----------------
+    async def record_change(
+        self,
+        product_id: int,
+        change_type: str,
+        changed_fields: list[str],
+        old_data: dict[str, Any] | None,
+        new_data: dict[str, Any],
+    ) -> ProductChange:
+        """Append a change-log row.
+
+        Writers are serialised with a transaction-level advisory lock *before* the sequence value
+        is drawn, so sequence numbers become visible in commit order and a delta consumer can
+        never skip a lower sequence that commits late.
+        """
+        await lock_change_writers(self.session)
+        change = ProductChange(
+            product_id=product_id,
+            change_type=change_type,
+            changed_fields=changed_fields,
+            old_data=old_data,
+            new_data=new_data,
+            recorded_at=utc_now(),
+        )
+        self.session.add(change)
+        await self.session.flush()
+        return change
 
     async def close_run(
         self,
@@ -265,16 +366,13 @@ class Repository:
             await self.session.flush()
 
             # Record creation change
-            change = ProductChange(
+            await self.record_change(
                 product_id=product.id,
                 change_type="created",
                 changed_fields=["all"],
                 old_data=None,
                 new_data={"sku": sku, "title": title, "price": str(regular_price)},
-                recorded_at=now,
             )
-            self.session.add(change)
-            await self.session.flush()
             return product, "created"
 
         # Existing product: compare hashes
@@ -286,11 +384,7 @@ class Repository:
         product.last_checked_at = now
         product.last_seen_run_id = run_id
 
-        # Merge category path if not present
-        if category_path not in product.category_paths:
-            product.category_paths = list(product.category_paths) + [category_path]
-        if source_category_id not in product.source_category_ids:
-            product.source_category_ids = list(product.source_category_ids) + [source_category_id]
+        # Category membership is merged (and logged) by associate_product_category().
 
         if not content_changed and not commerce_changed:
             # Invariant 17: Unchanged records do NOT update update timestamps or log changes
@@ -341,23 +435,89 @@ class Repository:
         else:
             change_type = "commerce_updated"
 
-        change = ProductChange(
+        await self.record_change(
             product_id=product.id,
             change_type=change_type,
             changed_fields=changed_fields,
             old_data=old_data,
             new_data=new_data,
-            recorded_at=now,
         )
-        self.session.add(change)
-        await self.session.flush()
 
         return product, change_type
 
+    async def update_commerce(
+        self,
+        product: Product,
+        currency: str,
+        regular_price: Decimal | None,
+        sale_price: Decimal | None,
+        stock_quantity: int | None,
+        stock_status: str,
+        availability_text: str | None,
+        commerce_hash: str,
+    ) -> str:
+        """Apply listing-level price/stock data to an existing product (stock refresh runs).
+
+        Content fields are never touched. Returns 'commerce_updated' or 'unchanged'.
+        """
+        now = utc_now()
+        product.last_seen_at = now
+        product.last_checked_at = now
+        if product.commerce_hash == commerce_hash:
+            await self.session.flush()
+            return "unchanged"
+
+        old_data = {"commerce_hash": product.commerce_hash}
+        product.currency = currency
+        product.regular_price = regular_price
+        product.sale_price = sale_price
+        product.stock_quantity = stock_quantity
+        product.stock_status = stock_status
+        product.availability_text = availability_text
+        product.commerce_hash = commerce_hash
+        product.stock_updated_at = now
+        await self.session.flush()
+        await self.record_change(
+            product_id=product.id,
+            change_type="commerce_updated",
+            changed_fields=["regular_price", "sale_price", "stock_status", "stock_quantity"],
+            old_data=old_data,
+            new_data={"commerce_hash": commerce_hash},
+        )
+        return "commerce_updated"
+
     async def associate_product_category(
-        self, product_id: int, category_id: int, ordered_path: list[str]
+        self,
+        product_id: int,
+        category_id: int,
+        ordered_path: list[str],
+        source_category_id: str | None = None,
+        log_change: bool = False,
     ) -> None:
-        """Associate a product with a category."""
+        """Associate a product with a category and merge the path into the product record.
+
+        When ``log_change`` is true and the product gained a category path it did not have
+        before, a ``categories_updated`` row is appended to the change feed.
+        """
+        product = (
+            await self.session.execute(select(Product).where(Product.id == product_id))
+        ).scalar_one()
+        path_added = ordered_path not in product.category_paths
+        if path_added:
+            product.category_paths = list(product.category_paths) + [ordered_path]
+        if source_category_id and source_category_id not in product.source_category_ids:
+            product.source_category_ids = list(product.source_category_ids) + [source_category_id]
+        if path_added:
+            await self.session.flush()
+            if log_change:
+                await self.record_change(
+                    product_id=product.id,
+                    change_type="categories_updated",
+                    changed_fields=["category_paths"],
+                    old_data=None,
+                    new_data={"category_path": ordered_path},
+                )
+
         query = select(ProductCategory).where(
             ProductCategory.product_id == product_id,
             ProductCategory.category_id == category_id,

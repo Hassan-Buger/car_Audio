@@ -247,6 +247,22 @@ class CategoryProgress(Base):
     category: Mapped["Category"] = relationship("Category")
 
 
+class RunCategoryProduct(Base):
+    """Products observed in a given category during a given run (exact, resumable membership)."""
+
+    __tablename__ = "run_category_products"
+
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True
+    )
+    category_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("categories.id", ondelete="CASCADE"), primary_key=True
+    )
+    product_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True, index=True
+    )
+
+
 class Job(Base):
     """Worker job queue record."""
 
