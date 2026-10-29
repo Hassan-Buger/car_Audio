@@ -93,19 +93,27 @@ def parse_listing_page(
 
     products: list[ParsedProductSummary] = []
     # Identify product cards
-    cards = soup.select(".product-card, .product-item, div[data-product-id]")
+    cards = soup.select(".product-card, .product-item, div[data-product-id], li.products-list-item")
 
     for card in cards:
         if not isinstance(card, Tag):
             continue
 
         # Extract title and URL
-        title_el = card.select_one(".product-title a, h2 a, h3 a, a.product-link")
-        if not title_el:
+        # Legacy markup links from the title; the live site links from the image block and uses a
+        # plain ``div.product-title`` for the name.
+        link_el = card.select_one(
+            ".product-title a, h2 a, h3 a, a.product-link, .product-image a, a[href]"
+        )
+        if not link_el:
             continue
-
-        title = title_el.get_text(strip=True)
-        rel_url = title_el.get("href", "")
+        name_el = card.select_one(".product-title, h2, h3")
+        title = name_el.get_text(" ", strip=True) if name_el else ""
+        if not title:
+            title = link_el.get_text(strip=True) or str(link_el.get("title", "")).strip()
+        if not title:
+            continue
+        rel_url = link_el.get("href", "")
         if not rel_url:
             continue
         full_url = urljoin(base_url, str(rel_url))
@@ -125,7 +133,7 @@ def parse_listing_page(
         brand = brand_el.get_text(strip=True) if brand_el else None
 
         # SKU / Model code
-        sku_el = card.select_one(".product-sku, .sku, .code")
+        sku_el = card.select_one(".product-sku, .product-code, .sku, .code")
         sku = sku_el.get_text(strip=True) if sku_el else slug
 
         # Price
@@ -133,11 +141,16 @@ def parse_listing_page(
         price_raw = price_el.get_text(strip=True) if price_el else None
 
         # Stock status text
-        stock_el = card.select_one(".product-stock, .stock-status, .availability")
+        stock_el = card.select_one(
+            ".product-stock, .stock-status, .availability, "
+            ".product-availability .availability-title, .product-availability"
+        )
         stock_text = stock_el.get_text(strip=True) if stock_el else None
 
         # Short specification
-        specs_el = card.select_one(".product-specs-summary, .specs-summary, .short-specs")
+        specs_el = card.select_one(
+            ".product-specs-summary, .specs-summary, .short-specs, .product-short-description"
+        )
         spec_summary = specs_el.get_text(strip=True) if specs_el else None
 
         # Thumbnail / image
