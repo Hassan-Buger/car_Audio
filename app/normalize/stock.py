@@ -24,6 +24,8 @@ def normalize_stock_status(raw_status: str | None) -> str:
     # Backorder checks (must be checked before generic out of stock)
     backorder_indicators = [
         "backorder",
+        "back order",
+        "back-order",
         "tellimisel",
         "järeltellimus",
         "pre-order",
@@ -45,6 +47,9 @@ def normalize_stock_status(raw_status: str | None) -> str:
         "pole laos",
         "sold out",
         "unavailable",
+        "not available",
+        "discontinued",
+        "lõpetatud",
     ]
     if any(ind in lower for ind in out_of_stock_indicators):
         return STOCK_STATUS_OUT_OF_STOCK
