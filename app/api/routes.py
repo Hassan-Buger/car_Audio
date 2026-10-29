@@ -203,11 +203,12 @@ async def get_stats(
         )
     ).scalar() or 0
 
-    # Latest runs
+    # Latest *finished* runs: a run still in progress has no finish time yet and must not hide the
+    # previous one.
     last_disc = (
         await db.execute(
             select(Run.finished_at)
-            .where(Run.type == "discovery")
+            .where(Run.type == "discovery", Run.finished_at.is_not(None))
             .order_by(Run.started_at.desc())
             .limit(1)
         )
@@ -216,7 +217,7 @@ async def get_stats(
     last_stock = (
         await db.execute(
             select(Run.finished_at)
-            .where(Run.type == "stock")
+            .where(Run.type == "stock", Run.finished_at.is_not(None))
             .order_by(Run.started_at.desc())
             .limit(1)
         )
