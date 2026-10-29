@@ -88,6 +88,10 @@ class TestStockNormalization:
         assert normalize_stock_status("Tellimisel") == STOCK_STATUS_BACKORDER
         assert normalize_stock_status("Järeltellimus") == STOCK_STATUS_BACKORDER
         assert normalize_stock_status("Pre-order") == STOCK_STATUS_BACKORDER
+        assert normalize_stock_status("Back order") == STOCK_STATUS_BACKORDER
+
+    def test_live_site_unavailable_wordings(self) -> None:
+        assert normalize_stock_status("Discontinued product") == STOCK_STATUS_OUT_OF_STOCK
 
     def test_unknown_stock_status(self) -> None:
         assert normalize_stock_status(None) == STOCK_STATUS_UNKNOWN
