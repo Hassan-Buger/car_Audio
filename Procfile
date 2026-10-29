@@ -1,2 +1,2 @@
-web: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
-worker: python -m app.worker
+web: SERVICE_ROLE=web python -m app.entrypoint
+worker: SERVICE_ROLE=worker python -m app.entrypoint
