@@ -91,3 +91,65 @@ class TestContentHashIndependentOfCategory:
         with_a = compute_content_hash(**kw, category_paths=[["a"]])  # type: ignore[arg-type]
         with_b = compute_content_hash(**kw, category_paths=[["b"]])  # type: ignore[arg-type]
         assert with_a != with_b != compute_content_hash(**kw)  # type: ignore[arg-type]
+
+
+class TestLiveMarkupListing:
+    """Listing markup modelled on the structure observed on the live site (invented values)."""
+
+    def _html(self) -> str:
+        from pathlib import Path
+
+        return (Path(__file__).parent / "fixtures" / "listing_live_markup.html").read_text(
+            encoding="utf-8"
+        )
+
+    def test_parses_live_style_cards(self) -> None:
+        from app.scraper.listing_parser import parse_listing_page
+
+        page = parse_listing_page(
+            self._html(), category_url="https://www.digisound.ee/products/car-stereo"
+        )
+        assert page.reported_total == 2229
+        assert page.next_start == 12 and page.has_next_page is True
+        assert page.subcategories == []  # filters are never treated as categories
+        assert [p.title for p in page.products] == ["EXAMPLE SUB 10A", "EXAMPLE AMP 4CH"]
+        first, second = page.products
+        assert first.sku == "SUB 10A" and second.sku == "AMP / 4CH"
+        assert first.slug == "example-sub-10a" and first.source_product_id == "example-sub-10a"
+        assert first.url == "https://www.digisound.ee/products/car-stereo/example-sub-10a"
+        assert first.price_raw is not None and first.price_raw.startswith("249,00")
+        assert first.stock_text == "In stock"
+        assert second.stock_text == "Temporarily out of stock"
+        assert first.spec_summary is not None and "subwoofer" in first.spec_summary
+
+
+class TestLiveMarkupDetail:
+    """Detail page markup modelled on the structure observed on the live site (invented values)."""
+
+    def test_parses_live_style_detail(self) -> None:
+        from pathlib import Path
+
+        from app.scraper.detail_parser import parse_detail_page
+
+        html = (Path(__file__).parent / "fixtures" / "detail_live_markup.html").read_text(
+            encoding="utf-8"
+        )
+        d = parse_detail_page(html)
+        assert d.title == "EXAMPLE SUB 10A"
+        assert d.sku == "SUB 10A"  # exact page SKU, not the URL slug
+        assert d.brand == "Example brand"  # not the site-logo link
+        assert d.ean_raw == "4037072027303"
+        assert d.regular_price_raw == "249,00 €"
+        assert d.stock_text == "In stock"
+        assert d.price_tax_text is None  # no VAT wording on the page: never assumed
+        assert d.specifications == [
+            {"name": "Voice coil", "value": '50 mm / 2"'},
+            {"name": "Impedance", "value": "2 x 2 Ohm"},
+        ]
+        assert len(d.images) == 2
+        assert d.category_breadcrumbs == ["CAR STEREO", "SUBWOOFERS AND ACCESSORIES", "Subwoofers"]
+        assert d.category_crumbs[-1] == (
+            "Subwoofers",
+            "https://www.digisound.ee/products/car-stereo/subwoofers-and-accessories/subwoofers",
+        )
+        assert d.source_product_id == "example-sub-10a"
