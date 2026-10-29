@@ -35,6 +35,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
@@ -727,6 +728,7 @@ class SyncEngine:
         stats: RunStats,
     ) -> bool:
         repo = self.repo
+        crumbs: list[tuple[str, str]] = []
         product = await repo.get_product(item.source_product_id)
         if product is None or product.last_seen_run_id != run.id:
             try:
@@ -735,6 +737,7 @@ class SyncEngine:
                 logger.warning("Detail fetch failed for %s: %s", item.url, exc)
                 await repo.record_request_failure(run.id, item.url, None, str(exc))
                 return False
+            crumbs = list(detail.category_crumbs)
             norm = build_normalized_product(item, detail, self.base_url)
             product, change = await repo.upsert_product(
                 source_product_id=norm.source_product_id,
@@ -779,7 +782,58 @@ class SyncEngine:
             log_change=not created_in_this_run,
         )
         await repo.add_run_category_member(run.id, cat.id, product.id)
+        await self._associate_breadcrumb_categories(
+            run, product.id, crumbs, log_change=not created_in_this_run
+        )
         return True
+
+    async def _associate_breadcrumb_categories(
+        self, run: Run, product_id: int, crumbs: list[tuple[str, str]], log_change: bool
+    ) -> None:
+        """Record the product's real category path from the detail page breadcrumbs.
+
+        Breadcrumb links are the only place the live site exposes the category hierarchy. Each
+        level becomes a category (source id = URL path below ``/products/``); the product is
+        associated with the deepest level. Categories created this way are never crawled, so they
+        carry no source-reported count and do not affect run completeness.
+        """
+        root_path = urlparse(self.root_url).path.rstrip("/")
+        base_path = root_path.rsplit("/", 1)[0]
+        parent_id: int | None = None
+        leaf: Category | None = None
+        for name, url in crumbs:
+            crumb_path = urlparse(url).path.rstrip("/")
+            if crumb_path != root_path and not crumb_path.startswith(root_path + "/"):
+                continue
+            rel = crumb_path[len(base_path) :].strip("/")
+            slugs = [part for part in rel.split("/") if part]
+            if not slugs:
+                continue
+            if rel == ROOT_SOURCE_ID:
+                category = await self.repo.get_category_by_source_id(ROOT_SOURCE_ID)
+                if category is None:
+                    continue
+            else:
+                category = await self.repo.get_or_create_category(
+                    source_id=rel,
+                    name=name,
+                    slug=slugs[-1],
+                    canonical_url=f"{self.base_url}{crumb_path}",
+                    parent_id=parent_id,
+                    ordered_path=slugs,
+                )
+            parent_id = category.id
+            leaf = category
+        if leaf is None or leaf.source_id == ROOT_SOURCE_ID:
+            return
+        await self.repo.associate_product_category(
+            product_id,
+            leaf.id,
+            list(leaf.ordered_path),
+            source_category_id=leaf.source_id,
+            log_change=log_change,
+        )
+        await self.repo.add_run_category_member(run.id, leaf.id, product_id)
 
     async def _fetch_detail(
         self, client: ScraperClient, item: ParsedProductSummary
