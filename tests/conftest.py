@@ -3,8 +3,16 @@
 import os
 from collections.abc import AsyncGenerator
 
-import pytest_asyncio
-from sqlalchemy.ext.asyncio import (
+TEST_DB_URL = os.environ.get(
+    "DATABASE_URL_TEST",
+    "postgresql+asyncpg://postgres:postgres@localhost:5432/digisound_test",
+)
+# The application treats DATABASE_URL as "configured" only when it is set explicitly, so the
+# test-suite points it at the dedicated test database before the app is imported.
+os.environ.setdefault("DATABASE_URL", TEST_DB_URL)
+
+import pytest_asyncio  # noqa: E402
+from sqlalchemy.ext.asyncio import (  # noqa: E402
     AsyncEngine,
     AsyncSession,
     async_sessionmaker,
@@ -12,13 +20,8 @@ from sqlalchemy.ext.asyncio import (
 )
 
 # Ensure all models are loaded
-import app.db.models  # noqa: F401
-from app.db.base import Base
-
-TEST_DB_URL = os.environ.get(
-    "DATABASE_URL_TEST",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/digisound_test",
-)
+import app.db.models  # noqa: F401, E402
+from app.db.base import Base  # noqa: E402
 
 
 @pytest_asyncio.fixture

@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -66,11 +66,41 @@ class Settings(BaseSettings):
     # Worker Schedules
     DISCOVERY_CRON: str = Field(
         default="0 2 * * *",
-        description="Cron expression for full discovery crawl",
+        description="Cron expression for full discovery crawl (empty string disables it)",
     )
     STOCK_CRON: str = Field(
         default="0 */4 * * *",
-        description="Cron expression for stock and price refresh",
+        description="Cron expression for stock and price refresh (empty string disables it)",
+    )
+    SCHEDULE_TIMEZONE: str = Field(
+        default="UTC",
+        description="IANA time zone in which the cron expressions are evaluated (e.g. UTC)",
+    )
+    BOOTSTRAP_DISCOVERY: bool = Field(
+        default=False,
+        description=(
+            "When true the worker enqueues exactly one discovery job on start-up if no "
+            "discovery job or run has ever been recorded"
+        ),
+    )
+    MAX_CATEGORY_DEPTH: int = Field(
+        default=4,
+        ge=1,
+        le=8,
+        description="Maximum category nesting depth followed below the root category",
+    )
+
+    # Process role (used by app.entrypoint)
+    SERVICE_ROLE: str = Field(
+        default="all",
+        description="web = API only, worker = background worker only, all = both in one service",
+    )
+
+    # Build identity (Railway injects RAILWAY_GIT_COMMIT_SHA at build and run time)
+    GIT_COMMIT_SHA: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("RAILWAY_GIT_COMMIT_SHA", "GIT_COMMIT_SHA"),
+        description="Commit SHA of the running build",
     )
 
     # Deployment Environment
@@ -78,6 +108,24 @@ class Settings(BaseSettings):
         default="development",
         description="Environment name: development, testing, or production",
     )
+
+    @field_validator("SERVICE_ROLE")
+    @classmethod
+    def validate_service_role(cls, v: str) -> str:
+        role = (v or "all").strip().lower()
+        if role not in {"web", "worker", "all"}:
+            raise ValueError("SERVICE_ROLE must be one of: web, worker, all")
+        return role
+
+    @property
+    def database_configured(self) -> bool:
+        """True only when DATABASE_URL was explicitly provided (not the localhost default)."""
+        return "DATABASE_URL" in self.model_fields_set
+
+    @property
+    def git_commit_short(self) -> str:
+        """Short commit SHA of the running build, or 'unknown'."""
+        return (self.GIT_COMMIT_SHA or "unknown")[:7]
 
     @field_validator("DATABASE_URL", "DATABASE_URL_TEST", mode="before")
     @classmethod

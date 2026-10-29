@@ -47,7 +47,7 @@ Conventions:
 - Unknown stock quantity is `NULL` (never zero).
 - Backorder is a distinct status from out of stock.
 - Consistent error envelope: `{"error": {"code": "...", "message": "...", "details": {...}}}`.""",
-    version="415178f",
+    version=get_settings().git_commit_short,
     openapi_tags=openapi_tags,
     lifespan=lifespan,
     docs_url="/docs",

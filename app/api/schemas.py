@@ -99,10 +99,16 @@ class CategoryProductsResponse(BaseModel):
 class HealthResponse(BaseModel):
     """Service liveness and diagnostic health status."""
 
-    status: str = Field("ok", description="Service liveness indicator")
-    database: str = Field(description="PostgreSQL connectivity status")
-    git_commit: str = Field(description="Deployed git commit short SHA")
-    alembic_revision: str = Field(description="Active Alembic migration revision")
+    status: str = Field("ok", description="'ok' when ready, 'degraded' otherwise (HTTP 503)")
+    database: str = Field(description="'ok', 'unavailable' or 'not_configured'")
+    git_commit: str = Field(description="Deployed git commit short SHA ('unknown' if not provided)")
+    alembic_revision: str = Field(description="Applied Alembic migration revision")
+    expected_alembic_revision: str | None = Field(
+        None, description="Head revision shipped with this build"
+    )
+    migrations_current: bool | None = Field(
+        None, description="Whether the applied revision equals the shipped head (null if unknown)"
+    )
     last_successful_discovery: datetime | None = Field(
         None, description="Timestamp of last complete discovery run"
     )

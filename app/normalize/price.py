@@ -69,19 +69,45 @@ def extract_currency(raw_price: str | None, default: str = "EUR") -> str:
 
 
 def normalize_tax_basis(raw_tax_text: str | None) -> str:
-    """Normalize tax basis to 'incl_vat', 'excl_vat', or 'unknown'."""
+    """Normalize tax basis to 'incl_vat', 'excl_vat', or 'unknown'.
+
+    The basis is only ever taken from text the page actually states; it is never assumed.
+    Estonian: "käibemaks" = VAT, "km" = VAT abbreviation, "sisaldab" = includes,
+    "koos" = together with, "ilma" / "ei sisalda" = without / does not include.
+    """
     if not raw_tax_text:
         return "unknown"
 
-    lower = raw_tax_text.lower()
-    if "koos km" in lower or "sisaldab km" in lower or "incl. vat" in lower or "incl vat" in lower:
-        return "incl_vat"
-    if (
-        "ilma km" in lower
-        or "ei sisalda km" in lower
-        or "excl. vat" in lower
-        or "excl vat" in lower
-    ):
+    lower = " ".join(raw_tax_text.lower().split())
+    excl_markers = (
+        "ilma km",
+        "ilma käibemaks",
+        "ei sisalda km",
+        "ei sisalda käibemaks",
+        "käibemaksuta",
+        "excl. vat",
+        "excl vat",
+        "excluding vat",
+        "ex vat",
+        "ex. vat",
+        "without vat",
+    )
+    if any(marker in lower for marker in excl_markers):
         return "excl_vat"
+
+    incl_markers = (
+        "koos km",
+        "koos käibemaks",
+        "sisaldab km",
+        "sisaldab käibemaks",
+        "käibemaksuga",
+        "incl. vat",
+        "incl vat",
+        "including vat",
+        "inc. vat",
+        "with vat",
+    )
+    if any(marker in lower for marker in incl_markers):
+        return "incl_vat"
 
     return "unknown"

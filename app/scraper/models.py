@@ -20,6 +20,16 @@ class ParsedProductSummary:
 
 
 @dataclass(frozen=True)
+class ParsedCategoryLink:
+    """A child category link found in an explicit category-navigation block."""
+
+    name: str
+    url: str
+    slug: str
+    count_hint: int | None = None
+
+
+@dataclass(frozen=True)
 class ParsedListingPage:
     """Listing page output including extracted products and pagination markers."""
 
@@ -27,6 +37,8 @@ class ParsedListingPage:
     reported_total: int | None
     next_start: int | None
     has_next_page: bool
+    title: str | None = None
+    subcategories: list[ParsedCategoryLink] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
