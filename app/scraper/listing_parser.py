@@ -5,7 +5,57 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 from bs4 import BeautifulSoup, Tag
 
-from app.scraper.models import ParsedListingPage, ParsedProductSummary
+from app.scraper.models import ParsedCategoryLink, ParsedListingPage, ParsedProductSummary
+
+# Explicit category-navigation blocks. Manufacturer / attribute / model filters are NOT categories
+# and are deliberately not matched by these selectors.
+CATEGORY_NAV_SELECTOR = (
+    ".category-tree a, .subcategories a, .category-list a, "
+    ".sidebar-categories a, nav.categories a, .category-navigation a"
+)
+_FACET_HINTS = ("manufacturers", "attributes", "filter", "sort=", "order=", "page=", "start=")
+
+
+def parse_category_links(
+    soup: BeautifulSoup, parent_url: str, base_url: str = "https://www.digisound.ee"
+) -> list[ParsedCategoryLink]:
+    """Extract child category links from explicit category navigation blocks.
+
+    Only links whose path is strictly below ``parent_url`` are returned; filter/facet links
+    (manufacturer, attribute, model, sort, pagination) are ignored. Returns an empty list when
+    the page has no explicit category navigation - category structure is never guessed.
+    """
+    parent_path = urlparse(urljoin(base_url, parent_url)).path.rstrip("/")
+    seen: set[str] = set()
+    links: list[ParsedCategoryLink] = []
+    for anchor in soup.select(CATEGORY_NAV_SELECTOR):
+        if not isinstance(anchor, Tag):
+            continue
+        href = str(anchor.get("href", "")).strip()
+        if not href or any(hint in href.lower() for hint in _FACET_HINTS):
+            continue
+        full = urljoin(base_url, href)
+        parsed = urlparse(full)
+        path = parsed.path.rstrip("/")
+        if parsed.query or not path.startswith(parent_path + "/"):
+            continue
+        canonical = f"{parsed.scheme}://{parsed.netloc}{path}"
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        raw_name = anchor.get_text(" ", strip=True)
+        count_hint: int | None = None
+        count_match = re.search(r"\((\d+)\)\s*$", raw_name)
+        if count_match:
+            count_hint = int(count_match.group(1))
+            raw_name = raw_name[: count_match.start()].strip()
+        slug = path.rsplit("/", 1)[-1]
+        links.append(
+            ParsedCategoryLink(
+                name=raw_name or slug, url=canonical, slug=slug, count_hint=count_hint
+            )
+        )
+    return links
 
 
 def parse_reported_total(soup: BeautifulSoup) -> int | None:
@@ -28,10 +78,16 @@ def parse_reported_total(soup: BeautifulSoup) -> int | None:
 
 
 def parse_listing_page(
-    html_text: str, base_url: str = "https://www.digisound.ee"
+    html_text: str,
+    base_url: str = "https://www.digisound.ee",
+    category_url: str | None = None,
 ) -> ParsedListingPage:
     """Parse a category listing page into structured products and pagination state."""
     soup = BeautifulSoup(html_text, "lxml")
+
+    h1 = soup.select_one(".category-header h1, h1")
+    page_title = h1.get_text(strip=True) if h1 else None
+    subcategories = parse_category_links(soup, category_url, base_url) if category_url else []
 
     reported_total = parse_reported_total(soup)
 
@@ -134,4 +190,6 @@ def parse_listing_page(
         reported_total=reported_total,
         next_start=next_start,
         has_next_page=has_next_page,
+        title=page_title,
+        subcategories=subcategories,
     )
