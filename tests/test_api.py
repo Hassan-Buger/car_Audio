@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_db
 from app.db.base import utc_now
-from app.db.models import Category, Job, Product
+from app.db.models import Category, Job, Product, Run
 from app.main import app
 
 
@@ -49,6 +49,22 @@ class TestApiReadEndpoints:
         assert "total_categories" in data
         assert "total_products" in data
         assert "in_stock_products" in data
+
+    @pytest.mark.asyncio
+    async def test_stats_last_run_ignores_run_still_in_progress(
+        self, api_client: AsyncClient, db_session: AsyncSession
+    ) -> None:
+        done = utc_now()
+        db_session.add_all(
+            [
+                Run(type="stock", status="complete", finished_at=done),
+                Run(type="stock", status="running"),
+            ]
+        )
+        await db_session.commit()
+        data = (await api_client.get("/api/stats")).json()
+        assert data["last_stock_run"] is not None
+        assert data["last_discovery_run"] is None
 
     @pytest.mark.asyncio
     async def test_categories_endpoint(
