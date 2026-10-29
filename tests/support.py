@@ -75,12 +75,20 @@ def detail_html(
     stock: str | None = None,
     vat: str | None = None,
     ean: str | None = "4006381333931",
+    crumbs: Sequence[tuple[str, str]] = (),
 ) -> str:
+    crumb_html = (
+        '<nav class="breadcrumb">'
+        + " ".join(f'<a href="{href}">{name}</a>' for name, href in crumbs)
+        + "</nav>"
+        if crumbs
+        else ""
+    )
     vat_html = f'<span class="vat-basis">{vat}</span>' if vat else ""
     ean_html = f'<div class="ean-row">EAN: <span class="ean">{ean}</span></div>' if ean else ""
     return f"""<!DOCTYPE html><html><head><title>{title or item.slug}</title>
 <link rel="canonical" href="{BASE}{item.url_path}"></head><body>
-<main><div class="product-details"><div class="brand">ACME</div>
+<main>{crumb_html}<div class="product-details"><div class="brand">ACME</div>
 <h1 class="title">{title or item.slug.upper()}</h1>
 <div class="sku-row">Tootekood: <span class="sku">{item.sku}</span></div>{ean_html}
 <div class="price-box"><span class="price-current">{price or item.price}</span>{vat_html}</div>
