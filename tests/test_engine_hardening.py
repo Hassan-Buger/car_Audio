@@ -241,7 +241,7 @@ class TestCategories:
         run = await make_engine(db_session).execute_discovery_run()
         cats = (await db_session.execute(select(Category))).scalars().all()
         assert [c.source_id for c in cats] == ["car-stereo"]
-        assert "no explicit category navigation" in (run.error_summary or "")
+        assert run.total_categories == 1  # facets and sort links never become categories
 
     @pytest.mark.asyncio
     @respx.mock
@@ -546,41 +546,140 @@ class TestLiveMarkupEndToEnd:
             r'<div class="load-more-products-wrapper">.*?</div>', "", listing, flags=re.S
         )
         listing = listing.replace("2229 Products", "1 Products")
-        detail = (fx / "detail_live_markup.html").read_text(encoding="utf-8")
-        # the remaining card is the AMP; point it at the fixture detail page
         listing = listing.replace("example-amp-4ch", "example-sub-10a")
+        detail = (fx / "detail_live_markup.html").read_text(encoding="utf-8")
         respx.get(ROOT).mock(return_value=httpx.Response(200, text=listing))
+        for cat_path in ("subwoofers-and-accessories", "subwoofers-and-accessories/subwoofers"):
+            respx.get(f"{ROOT}/{cat_path}").mock(return_value=httpx.Response(200, text=listing))
         respx.get(f"{BASE}/products/car-stereo/example-sub-10a").mock(
             return_value=httpx.Response(200, text=detail)
         )
 
         run = await make_engine(db_session).execute_discovery_run()
 
-        assert run.status == "complete"
+        assert run.status == "complete", run.error_summary
+        assert run.total_categories == 3  # root + two breadcrumb levels, each crawled
         product = (await db_session.execute(select(Product))).scalar_one()
         assert product.sku == "SUB 10A" and product.brand == "Example brand"
-        assert product.category_paths == [
+        assert sorted(product.category_paths, key=len) == [
             ["car-stereo"],
+            ["car-stereo", "subwoofers-and-accessories"],
             ["car-stereo", "subwoofers-and-accessories", "subwoofers"],
         ]
-        ids = {c.source_id for c in (await db_session.execute(select(Category))).scalars()}
-        assert ids == {
+        cats = {c.source_id: c for c in (await db_session.execute(select(Category))).scalars()}
+        assert set(cats) == {
             "car-stereo",
             "car-stereo/subwoofers-and-accessories",
             "car-stereo/subwoofers-and-accessories/subwoofers",
         }
-        leaf = (
-            await db_session.execute(
-                select(Category).where(
-                    Category.source_id == "car-stereo/subwoofers-and-accessories/subwoofers"
+        leaf = cats["car-stereo/subwoofers-and-accessories/subwoofers"]
+        parent = cats["car-stereo/subwoofers-and-accessories"]
+        assert leaf.parent_id == parent.id
+        assert leaf.source_reported_count == 1  # independent count read from its own listing
+
+
+CAT_X = ("X", "/products/car-stereo/x")
+CAT_Y = ("Y", "/products/car-stereo/y")
+ROOT_CRUMB = ("CAR STEREO", "/products/car-stereo")
+
+
+def mock_breadcrumb_world(item: Item, category: tuple[str, str], also_in: list[str]) -> None:
+    """Root + category listings and a detail page whose breadcrumb names ``category``."""
+    respx.reset()
+    respx.get(ROOT).mock(return_value=httpx.Response(200, text=listing_html([item], 1)))
+    for slug in {category[1].rsplit("/", 1)[-1], *also_in}:
+        url = f"{ROOT}/{slug}"
+        respx.get(url).mock(
+            return_value=httpx.Response(
+                200, text=listing_html([item], 1, base_path=f"/products/car-stereo/{slug}")
+            )
+        )
+    respx.get(f"{BASE}{item.url_path}").mock(
+        return_value=httpx.Response(200, text=detail_html(item, crumbs=[ROOT_CRUMB, category]))
+    )
+
+
+class TestCategoryMembershipDeltas:
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_stable_recrawl_emits_no_events(self, db_session: AsyncSession) -> None:
+        mock_breadcrumb_world(A, CAT_X, [])
+        first = await make_engine(db_session).execute_discovery_run()
+        assert first.status == "complete", first.error_summary
+        events = await count(db_session, ProductChange)
+        mock_breadcrumb_world(A, CAT_X, [])
+        second = await make_engine(db_session).execute_discovery_run()
+        assert second.status == "complete", second.error_summary
+        assert await count(db_session, ProductChange) == events  # categories are not a false delta
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_category_only_move_generates_delta_events(
+        self, db_session: AsyncSession
+    ) -> None:
+        mock_breadcrumb_world(A, CAT_X, [])
+        assert (await make_engine(db_session).execute_discovery_run()).status == "complete"
+        product = (await db_session.execute(select(Product))).scalar_one()
+        assert ["car-stereo", "x"] in product.category_paths
+        before = int((await db_session.execute(select(func.max(ProductChange.seq)))).scalar_one())
+
+        # Nothing about the product changes except its category: X -> Y
+        mock_breadcrumb_world(A, CAT_Y, [])
+        run = await make_engine(db_session).execute_discovery_run()
+        assert run.status == "complete", run.error_summary
+
+        await db_session.refresh(product)
+        assert ["car-stereo", "y"] in product.category_paths
+        assert ["car-stereo", "x"] not in product.category_paths
+        new_changes = (
+            (
+                await db_session.execute(
+                    select(ProductChange)
+                    .where(ProductChange.seq > before)
+                    .order_by(ProductChange.seq)
                 )
             )
-        ).scalar_one()
-        parent = (
-            await db_session.execute(
-                select(Category).where(
-                    Category.source_id == "car-stereo/subwoofers-and-accessories"
+            .scalars()
+            .all()
+        )
+        assert new_changes and {c.change_type for c in new_changes} == {"categories_updated"}
+        assert any(c.new_data and c.new_data.get("removed") for c in new_changes)
+        memberships = (
+            (
+                await db_session.execute(
+                    select(Category.source_id)
+                    .join(ProductCategory, ProductCategory.category_id == Category.id)
+                    .where(ProductCategory.product_id == product.id)
                 )
             )
-        ).scalar_one()
-        assert leaf.parent_id == parent.id and leaf.source_reported_count is None
+            .scalars()
+            .all()
+        )
+        assert sorted(memberships) == ["car-stereo", "car-stereo/y"]
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_breadcrumb_category_missing_from_listing_is_incomplete(
+        self, db_session: AsyncSession
+    ) -> None:
+        mock_breadcrumb_world(A, CAT_X, [])
+        # X's own listing exists but does not contain the product its breadcrumb claims
+        respx.get(f"{ROOT}/x").mock(
+            return_value=httpx.Response(
+                200,
+                text=listing_html([B], 1, base_path="/products/car-stereo/x"),
+            )
+        )
+        respx.get(f"{BASE}{B.url_path}").mock(
+            return_value=httpx.Response(
+                200, text=detail_html(B, crumbs=[ROOT_CRUMB, ("Z", "/products/car-stereo/z")])
+            )
+        )
+        respx.get(f"{ROOT}/z").mock(
+            return_value=httpx.Response(
+                200, text=listing_html([B], 1, base_path="/products/car-stereo/z")
+            )
+        )
+        run = await make_engine(db_session).execute_discovery_run()
+        assert run.status == "incomplete"
+        assert "missing from its listing" in (run.error_summary or "")

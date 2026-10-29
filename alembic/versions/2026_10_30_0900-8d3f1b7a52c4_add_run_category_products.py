@@ -24,10 +24,11 @@ def upgrade() -> None:
         sa.Column('run_id', sa.UUID(), nullable=False),
         sa.Column('category_id', sa.Integer(), nullable=False),
         sa.Column('product_id', sa.Integer(), nullable=False),
+        sa.Column('source', sa.String(length=16), nullable=False, server_default='listing'),
         sa.ForeignKeyConstraint(['run_id'], ['runs.id'], ondelete='CASCADE'),
         sa.ForeignKeyConstraint(['category_id'], ['categories.id'], ondelete='CASCADE'),
         sa.ForeignKeyConstraint(['product_id'], ['products.id'], ondelete='CASCADE'),
-        sa.PrimaryKeyConstraint('run_id', 'category_id', 'product_id'),
+        sa.PrimaryKeyConstraint('run_id', 'category_id', 'product_id', 'source'),
     )
     op.create_index(
         op.f('ix_run_category_products_product_id'),
