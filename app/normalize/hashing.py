@@ -30,11 +30,15 @@ def compute_content_hash(
     long_description: str | None,
     specifications: list[dict[str, Any]],
     images: list[str],
-    category_paths: list[list[str]],
+    category_paths: list[list[str]] | None = None,
 ) -> str:
     """Compute SHA-256 hash over product descriptive/content fields.
 
-    Only changes to these content fields will trigger a content hash update.
+    Only changes to these content fields will trigger a content hash update. Category
+    membership is intentionally *not* part of the hash by default (pass ``category_paths=None``):
+    a product that appears in several categories is crawled once per category, and hashing the
+    path of whichever category happened to be visited would flip the hash and produce false deltas.
+    Membership changes are tracked separately as ``categories_updated`` changes.
     """
     content_payload = {
         "source_product_id": source_product_id,
@@ -47,8 +51,9 @@ def compute_content_hash(
         "long_description": long_description or "",
         "specifications": specifications,
         "images": images,
-        "category_paths": category_paths,
     }
+    if category_paths is not None:
+        content_payload["category_paths"] = category_paths
 
     serialized = json.dumps(
         _serialize_for_hash(content_payload),
