@@ -525,3 +525,62 @@ class TestRunLock:
         await probe({})
         assert observed[-1] is True  # and it is free again afterwards
         await asyncio.sleep(0)
+
+
+class TestLiveMarkupEndToEnd:
+    """Discovery over live-style markup records the real category path from breadcrumbs."""
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_breadcrumb_category_path_is_recorded(self, db_session: AsyncSession) -> None:
+        import re
+        from pathlib import Path
+
+        fx = Path(__file__).parent / "fixtures"
+        listing = (fx / "listing_live_markup.html").read_text(encoding="utf-8")
+        # keep only the first card, a single page, and a consistent total
+        listing = re.sub(
+            r'<li class="products-list-item">.*?</li>', "", listing, count=1, flags=re.S
+        )
+        listing = re.sub(
+            r'<div class="load-more-products-wrapper">.*?</div>', "", listing, flags=re.S
+        )
+        listing = listing.replace("2229 Products", "1 Products")
+        detail = (fx / "detail_live_markup.html").read_text(encoding="utf-8")
+        # the remaining card is the AMP; point it at the fixture detail page
+        listing = listing.replace("example-amp-4ch", "example-sub-10a")
+        respx.get(ROOT).mock(return_value=httpx.Response(200, text=listing))
+        respx.get(f"{BASE}/products/car-stereo/example-sub-10a").mock(
+            return_value=httpx.Response(200, text=detail)
+        )
+
+        run = await make_engine(db_session).execute_discovery_run()
+
+        assert run.status == "complete"
+        product = (await db_session.execute(select(Product))).scalar_one()
+        assert product.sku == "SUB 10A" and product.brand == "Example brand"
+        assert product.category_paths == [
+            ["car-stereo"],
+            ["car-stereo", "subwoofers-and-accessories", "subwoofers"],
+        ]
+        ids = {c.source_id for c in (await db_session.execute(select(Category))).scalars()}
+        assert ids == {
+            "car-stereo",
+            "car-stereo/subwoofers-and-accessories",
+            "car-stereo/subwoofers-and-accessories/subwoofers",
+        }
+        leaf = (
+            await db_session.execute(
+                select(Category).where(
+                    Category.source_id == "car-stereo/subwoofers-and-accessories/subwoofers"
+                )
+            )
+        ).scalar_one()
+        parent = (
+            await db_session.execute(
+                select(Category).where(
+                    Category.source_id == "car-stereo/subwoofers-and-accessories"
+                )
+            )
+        ).scalar_one()
+        assert leaf.parent_id == parent.id and leaf.source_reported_count is None

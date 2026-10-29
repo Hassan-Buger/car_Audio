@@ -61,3 +61,4 @@ class ParsedProductDetail:
     specifications: list[dict[str, str]] = field(default_factory=list)
     images: list[str] = field(default_factory=list)
     category_breadcrumbs: list[str] = field(default_factory=list)
+    category_crumbs: list[tuple[str, str]] = field(default_factory=list)  # (name, absolute url)
