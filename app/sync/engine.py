@@ -67,6 +67,7 @@ from app.sync.reconciliation import evaluate_category_completeness
 logger = logging.getLogger(__name__)
 
 ROOT_SOURCE_ID = "car-stereo"
+MAX_CATEGORY_PASSES = 6
 ROOT_URL_PATH = "/products/car-stereo"
 ROOT_DEFAULT_NAME = "CAR STEREO"
 
@@ -424,7 +425,77 @@ class SyncEngine:
         targets = await self._discover_categories(client, run, stats)
         for target in targets:
             await self._crawl_category(client, run, target, stats, "discovery", callback)
-        return await self._summarise(run, targets, stats)
+        # The site publishes its category hierarchy only in product breadcrumbs. Every category
+        # named by a breadcrumb is crawled through its own listing as well, so membership and
+        # counts are checked independently of the breadcrumbs. New products found this way can
+        # reveal further categories, hence the bounded fix-point loop.
+        await self._crawl_breadcrumb_categories(client, run, targets, stats, callback)
+        await self._verify_memberships(run, targets)
+        status, summary, total, done = await self._summarise(run, targets, stats)
+        if status == "complete":
+            shrunk = await self.repo.reconcile_product_categories(run.id)
+            await self.session.commit()
+            if shrunk:
+                summary = (
+                    f"{summary}; " if summary else ""
+                ) + f"{shrunk} products lost a category membership (logged as categories_updated)"
+        return status, summary, total, done
+
+    async def _crawl_breadcrumb_categories(
+        self,
+        client: ScraperClient,
+        run: Run,
+        targets: list[CategoryTarget],
+        stats: RunStats,
+        callback: ProgressCallback | None,
+    ) -> None:
+        crawled = {t.category.source_id for t in targets}
+        for _ in range(MAX_CATEGORY_PASSES):
+            pending = await self.repo.get_categories_seen_since(
+                run.started_at, ROOT_SOURCE_ID, crawled
+            )
+            if not pending:
+                return
+            for category in pending:
+                target = CategoryTarget(
+                    category=category,
+                    url=category.canonical_url,
+                    ordered_path=list(category.ordered_path),
+                )
+                targets.append(target)
+                crawled.add(category.source_id)
+                await self._crawl_category(client, run, target, stats, "discovery", callback)
+        stats.notes.append(
+            f"category discovery stopped after {MAX_CATEGORY_PASSES} passes; "
+            "further breadcrumb categories may exist"
+        )
+
+    async def _verify_memberships(self, run: Run, targets: list[CategoryTarget]) -> None:
+        """Cross-check breadcrumb membership against each category's own listing."""
+        for target in targets:
+            progress = await self.repo.get_or_create_category_progress(run.id, target.category.id)
+            if progress.status != "complete":
+                continue
+            crumb_only, listing_only = await self.repo.membership_differences(
+                run.id, target.category.id
+            )
+            notes: list[str] = []
+            if crumb_only:
+                progress.status = "incomplete"
+                notes.append(
+                    f"{crumb_only} products name this category in their breadcrumb but are "
+                    "missing from its listing"
+                )
+            if listing_only:
+                notes.append(
+                    f"{listing_only} listed products have a breadcrumb elsewhere "
+                    "(secondary membership)"
+                )
+            if notes:
+                progress.discrepancy_note = "; ".join(
+                    [n for n in [progress.discrepancy_note, *notes] if n]
+                )
+        await self.session.commit()
 
     async def _run_stock(
         self,
@@ -546,11 +617,6 @@ class SyncEngine:
                 queue.append((link.url, [*path, link.slug], link.name, depth + 1, category.id))
 
         await self.session.commit()
-        if len(targets) == 1:
-            stats.notes.append(
-                "Category tree: no explicit category navigation was found below the root page; "
-                "only the root category was crawled (manufacturer/model facets are not categories)"
-            )
         return targets
 
     # ------------------------------------------------------------------ category crawl
@@ -774,33 +840,26 @@ class SyncEngine:
                 stats.updated += 1
 
         created_in_this_run = product.first_seen_at >= run.started_at
-        await repo.associate_product_category(
-            product.id,
-            cat.id,
-            list(target.ordered_path),
-            source_category_id=cat.source_id,
-            log_change=not created_in_this_run,
-        )
-        await repo.add_run_category_member(run.id, cat.id, product.id)
-        await self._associate_breadcrumb_categories(
-            run, product.id, crumbs, log_change=not created_in_this_run
+        memberships = [(cat.id, list(target.ordered_path), cat.source_id)]
+        await repo.add_run_category_member(run.id, cat.id, product.id, "listing")
+        for crumb_cat in await self._breadcrumb_categories(crumbs):
+            memberships.append((crumb_cat.id, list(crumb_cat.ordered_path), crumb_cat.source_id))
+            await repo.add_run_category_member(run.id, crumb_cat.id, product.id, "breadcrumb")
+        await repo.associate_product_categories(
+            product.id, memberships, log_change=not created_in_this_run
         )
         return True
 
-    async def _associate_breadcrumb_categories(
-        self, run: Run, product_id: int, crumbs: list[tuple[str, str]], log_change: bool
-    ) -> None:
-        """Record the product's real category path from the detail page breadcrumbs.
+    async def _breadcrumb_categories(self, crumbs: list[tuple[str, str]]) -> list[Category]:
+        """Resolve (creating as needed) every category level named by a detail breadcrumb.
 
-        Breadcrumb links are the only place the live site exposes the category hierarchy. Each
-        level becomes a category (source id = URL path below ``/products/``); the product is
-        associated with the deepest level. Categories created this way are never crawled, so they
-        carry no source-reported count and do not affect run completeness.
+        Each level becomes a category whose source id is the URL path below ``/products/``.
+        Categories created this way are crawled later through their own listing.
         """
         root_path = urlparse(self.root_url).path.rstrip("/")
         base_path = root_path.rsplit("/", 1)[0]
         parent_id: int | None = None
-        leaf: Category | None = None
+        resolved: list[Category] = []
         for name, url in crumbs:
             crumb_path = urlparse(url).path.rstrip("/")
             if crumb_path != root_path and not crumb_path.startswith(root_path + "/"):
@@ -823,17 +882,8 @@ class SyncEngine:
                     ordered_path=slugs,
                 )
             parent_id = category.id
-            leaf = category
-        if leaf is None or leaf.source_id == ROOT_SOURCE_ID:
-            return
-        await self.repo.associate_product_category(
-            product_id,
-            leaf.id,
-            list(leaf.ordered_path),
-            source_category_id=leaf.source_id,
-            log_change=log_change,
-        )
-        await self.repo.add_run_category_member(run.id, leaf.id, product_id)
+            resolved.append(category)
+        return resolved
 
     async def _fetch_detail(
         self, client: ScraperClient, item: ParsedProductSummary
