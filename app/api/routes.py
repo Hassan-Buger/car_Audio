@@ -7,7 +7,7 @@ import uuid
 from typing import Annotated, Any
 from urllib.parse import unquote
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload
@@ -25,6 +25,9 @@ from app.api.schemas import (
     ProductsPageResponse,
     StatsResponse,
 )
+from app.config import Settings, get_settings
+from app.db.lock import lock_change_readers
+from app.db.migrations import get_expected_alembic_head
 from app.db.models import Category, Job, Product, ProductCategory, ProductChange, Run
 from app.jobs.queue import JobQueue
 
@@ -60,60 +63,95 @@ def decode_delta_cursor(cursor: str) -> tuple[int, int, int]:
 
 # ---------------- System Endpoints ----------------
 @router.get(
+    "/live",
+    tags=["System"],
+    summary="Liveness probe",
+    description="Returns 200 whenever the web process is up. Does not touch the database; use it as the platform health-check path. Use /health for real readiness.",
+)
+async def liveness() -> dict[str, str]:
+    return {"status": "alive"}
+
+
+@router.get(
     "/health",
     response_model=HealthResponse,
     tags=["System"],
-    summary="Health Check & Diagnostic Status",
-    description="Reports service liveness, database connectivity, deployed commit short SHA, active Alembic revision, and last successful discovery/stock sync timestamps without making external source requests.",
+    summary="Readiness & Diagnostic Status",
+    description="Reports readiness: database connectivity, deployed commit, applied vs. expected Alembic revision, and last successful discovery/stock runs, without any request to the source site. Returns HTTP 503 with status 'degraded' when the database is not configured, unreachable, or (in production) not migrated to the shipped head.",
 )
 async def health_check(
+    response: Response,
     db: Annotated[AsyncSession, Depends(get_db)],
+    settings: Annotated[Settings, Depends(get_settings)],
 ) -> HealthResponse:
-    # 1. Verify DB connection
-    db_status = "ok"
-    try:
-        await db.execute(text("SELECT 1"))
-    except Exception as e:
-        logger.error("Database health check failed: %s", e)
-        db_status = f"unhealthy: {e}"
-
-    # 2. Get active alembic revision
+    expected_head = get_expected_alembic_head()
     alembic_rev = "unknown"
-    try:
-        rev_res = await db.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
-        rev_val = rev_res.scalar()
-        if rev_val:
-            alembic_rev = str(rev_val)
-    except Exception:
-        pass
-
-    # 3. Get last successful runs
     last_disc: Any = None
     last_stock: Any = None
-    try:
-        disc_query = (
-            select(Run.finished_at)
-            .where(Run.type == "discovery", Run.status == "complete")
-            .order_by(Run.finished_at.desc())
-            .limit(1)
-        )
-        last_disc = (await db.execute(disc_query)).scalar_one_or_none()
 
-        stock_query = (
-            select(Run.finished_at)
-            .where(Run.type == "stock", Run.status == "complete")
-            .order_by(Run.finished_at.desc())
-            .limit(1)
-        )
-        last_stock = (await db.execute(stock_query)).scalar_one_or_none()
-    except Exception:
-        pass
+    if not settings.database_configured:
+        db_status = "not_configured"
+    else:
+        db_status = "ok"
+        try:
+            await db.execute(text("SELECT 1"))
+        except Exception:
+            logger.exception("Database health check failed")
+            db_status = "unavailable"
+
+    if db_status == "ok":
+        try:
+            rev_val = (
+                await db.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
+            ).scalar()
+            if rev_val:
+                alembic_rev = str(rev_val)
+        except Exception:
+            await db.rollback()
+        try:
+            last_disc = (
+                await db.execute(
+                    select(Run.finished_at)
+                    .where(Run.type == "discovery", Run.status == "complete")
+                    .order_by(Run.finished_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            last_stock = (
+                await db.execute(
+                    select(Run.finished_at)
+                    .where(Run.type == "stock", Run.status == "complete")
+                    .order_by(Run.finished_at.desc())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+        except Exception:
+            await db.rollback()
+
+    migrations_current: bool | None = None
+    if alembic_rev != "unknown" and expected_head:
+        migrations_current = alembic_rev == expected_head
+
+    degraded = db_status != "ok"
+    if (
+        db_status == "ok"
+        and settings.ENVIRONMENT == "production"
+        and migrations_current is not True
+    ):
+        degraded = True
+    if migrations_current is False:
+        degraded = True
+
+    if degraded:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return HealthResponse(
-        status="ok",
+        status="degraded" if degraded else "ok",
         database=db_status,
-        git_commit="415178f",
+        git_commit=settings.git_commit_short,
         alembic_revision=alembic_rev,
+        expected_alembic_revision=expected_head,
+        migrations_current=migrations_current,
         last_successful_discovery=last_disc,
         last_successful_stock=last_stock,
     )
@@ -482,6 +520,9 @@ async def get_products_delta(
         window_from, window_until, last_seq = decode_delta_cursor(cursor)
     else:
         window_from = from_seq
+        # Wait for in-flight change writers so MAX(seq) is a safe window horizon: every lower
+        # sequence is then committed or rolled back and can never appear later.
+        await lock_change_readers(db)
         max_seq_res = await db.execute(select(func.max(ProductChange.seq)))
         current_max = max_seq_res.scalar_one_or_none()
         window_until = (
