@@ -261,6 +261,9 @@ class RunCategoryProduct(Base):
     product_id: Mapped[int] = mapped_column(
         Integer, ForeignKey("products.id", ondelete="CASCADE"), primary_key=True, index=True
     )
+    # "listing" = the product appeared in the category's own paginated listing;
+    # "breadcrumb" = the product's detail page breadcrumb names this category.
+    source: Mapped[str] = mapped_column(String(16), primary_key=True, default="listing")
 
 
 class Job(Base):

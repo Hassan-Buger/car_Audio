@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from datetime import datetime
 from decimal import Decimal
 from typing import Any
 
@@ -142,22 +143,172 @@ class Repository:
 
     # ---------------- Run membership (exact per-run, per-category product sets) -------------
     async def add_run_category_member(
-        self, run_id: uuid.UUID, category_id: int, product_id: int
+        self, run_id: uuid.UUID, category_id: int, product_id: int, source: str = "listing"
     ) -> None:
-        """Record that a product was seen in a category during a run (idempotent)."""
+        """Record that a product was seen in a category during a run (idempotent).
+
+        ``source`` is "listing" (seen in the category's own listing) or "breadcrumb" (named by the
+        product's detail-page breadcrumb).
+        """
         stmt = (
             pg_insert(RunCategoryProduct)
-            .values(run_id=run_id, category_id=category_id, product_id=product_id)
+            .values(run_id=run_id, category_id=category_id, product_id=product_id, source=source)
             .on_conflict_do_nothing()
         )
         await self.session.execute(stmt)
 
-    async def count_run_category_members(self, run_id: uuid.UUID, category_id: int) -> int:
-        """Distinct products recorded for a category in a run."""
+    async def count_run_category_members(
+        self, run_id: uuid.UUID, category_id: int, source: str = "listing"
+    ) -> int:
+        """Distinct products recorded for a category in a run (listing membership by default)."""
         query = select(func.count()).where(
-            RunCategoryProduct.run_id == run_id, RunCategoryProduct.category_id == category_id
+            RunCategoryProduct.run_id == run_id,
+            RunCategoryProduct.category_id == category_id,
+            RunCategoryProduct.source == source,
         )
         return int((await self.session.execute(query)).scalar_one())
+
+    async def membership_differences(self, run_id: uuid.UUID, category_id: int) -> tuple[int, int]:
+        """Compare breadcrumb vs listing membership of one category in a run.
+
+        Returns ``(in_breadcrumb_not_listing, in_listing_not_breadcrumb)``.
+        """
+        rows = await self.session.execute(
+            select(RunCategoryProduct.source, RunCategoryProduct.product_id).where(
+                RunCategoryProduct.run_id == run_id, RunCategoryProduct.category_id == category_id
+            )
+        )
+        by_source: dict[str, set[int]] = {"listing": set(), "breadcrumb": set()}
+        for source, product_id in rows.all():
+            by_source.setdefault(source, set()).add(product_id)
+        return (
+            len(by_source["breadcrumb"] - by_source["listing"]),
+            len(by_source["listing"] - by_source["breadcrumb"]),
+        )
+
+    async def get_categories_seen_since(
+        self, since: datetime, root_source_id: str, exclude: set[str]
+    ) -> list[Category]:
+        """Sub-categories of the root touched at/after ``since``, shallowest first."""
+        rows = await self.session.execute(
+            select(Category).where(
+                Category.source_id.like(f"{root_source_id}/%"), Category.last_seen_at >= since
+            )
+        )
+        cats = [c for c in rows.scalars().all() if c.source_id not in exclude]
+        return sorted(cats, key=lambda c: (len(c.ordered_path), c.source_id))
+
+    async def reconcile_product_categories(self, run_id: uuid.UUID) -> int:
+        """Make stored category membership equal to what a *complete* run observed.
+
+        Stale memberships (a product that moved or left a category) are removed and logged as a
+        ``categories_updated`` change so delta consumers see category-only changes. Returns the
+        number of products whose membership shrank.
+        """
+        rows = await self.session.execute(
+            select(RunCategoryProduct.product_id, RunCategoryProduct.category_id)
+            .where(RunCategoryProduct.run_id == run_id)
+            .distinct()
+        )
+        desired: dict[int, set[int]] = {}
+        for product_id, category_id in rows.all():
+            desired.setdefault(product_id, set()).add(category_id)
+        if not desired:
+            return 0
+        cats = {c.id: c for c in (await self.session.execute(select(Category))).scalars().all()}
+        changed = 0
+        for product_id, wanted in desired.items():
+            product = (
+                await self.session.execute(select(Product).where(Product.id == product_id))
+            ).scalar_one()
+            assocs = (
+                (
+                    await self.session.execute(
+                        select(ProductCategory).where(ProductCategory.product_id == product_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            stale = [a for a in assocs if a.category_id not in wanted]
+            for assoc in stale:
+                await self.session.delete(assoc)
+            wanted_paths = [list(cats[c].ordered_path) for c in wanted if c in cats]
+            wanted_set = {tuple(p) for p in wanted_paths}
+            current = [list(p) for p in product.category_paths]
+            removed = [p for p in current if tuple(p) not in wanted_set]
+            if not stale and not removed:
+                continue
+            product.category_paths = sorted(wanted_paths, key=lambda p: (len(p), p))
+            product.source_category_ids = sorted(cats[c].source_id for c in wanted if c in cats)
+            await self.session.flush()
+            if removed:
+                await self.record_change(
+                    product_id=product.id,
+                    change_type="categories_updated",
+                    changed_fields=["category_paths"],
+                    old_data={"category_paths": current},
+                    new_data={"category_paths": product.category_paths, "removed": removed},
+                )
+                changed += 1
+        return changed
+
+    async def associate_product_categories(
+        self,
+        product_id: int,
+        memberships: list[tuple[int, list[str], str]],
+        log_change: bool = False,
+    ) -> None:
+        """Associate a product with several categories at once; log at most one change.
+
+        ``memberships`` holds ``(category_id, ordered_path, source_category_id)``. When
+        ``log_change`` is true and any path was new, a single ``categories_updated`` change lists
+        every added path.
+        """
+        product = (
+            await self.session.execute(select(Product).where(Product.id == product_id))
+        ).scalar_one()
+        existing = {
+            a.category_id
+            for a in (
+                await self.session.execute(
+                    select(ProductCategory).where(ProductCategory.product_id == product_id)
+                )
+            )
+            .scalars()
+            .all()
+        }
+        added: list[list[str]] = []
+        paths = [list(p) for p in product.category_paths]
+        source_ids = list(product.source_category_ids)
+        for category_id, ordered_path, source_id in memberships:
+            if ordered_path not in paths:
+                paths.append(list(ordered_path))
+                added.append(list(ordered_path))
+            if source_id and source_id not in source_ids:
+                source_ids.append(source_id)
+            if category_id not in existing:
+                self.session.add(
+                    ProductCategory(
+                        product_id=product_id,
+                        category_id=category_id,
+                        ordered_path=list(ordered_path),
+                    )
+                )
+                existing.add(category_id)
+        if added:
+            product.category_paths = paths
+        if source_ids != list(product.source_category_ids):
+            product.source_category_ids = source_ids
+        await self.session.flush()
+        if added and log_change:
+            await self.record_change(
+                product_id=product.id,
+                change_type="categories_updated",
+                changed_fields=["category_paths"],
+                old_data=None,
+                new_data={"added_category_paths": added},
+            )
 
     async def get_product(self, source_product_id: str) -> Product | None:
         """Fetch a digisound product by its supplier product id."""
