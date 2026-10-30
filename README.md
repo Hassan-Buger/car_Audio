@@ -119,6 +119,7 @@ See [docs/RAILWAY_DEPLOYMENT.md](docs/RAILWAY_DEPLOYMENT.md). In short: the Dock
 ## Documentation
 
 - [Railway Deployment](docs/RAILWAY_DEPLOYMENT.md): Roles, variables, schedules and completeness rules.
+- [API Integration Guide](docs/API_INTEGRATION.md): Authentication, endpoints, pagination, delta feed, stock mapping and schedules.
 - [WordPress Integration Guide](docs/wordpress-integration.md): Exact SKU lookup, 409 handling, and delta feed consumption.
 - [Source Findings & Limitations](docs/limitations.md): Creamarketing WebAdmin 7 details, filter facets analysis, and geo-blocking behavior.
 - [Deployment Evidence](docs/deploy-evidence.md): Earlier migration verification and curl testing commands.
