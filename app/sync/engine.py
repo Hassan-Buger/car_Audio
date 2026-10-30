@@ -924,17 +924,16 @@ class SyncEngine:
         stock_quantity = product.stock_quantity
         availability_text = product.availability_text
         if item.stock_text:
-            # Listing cards and detail pages word availability differently ("In stock" vs "Laos"),
-            # so only a change in the normalised status or an explicit different quantity is a
-            # real stock change; otherwise the stored wording is kept to avoid flip-flopping.
+            # Discovery and stock runs both take availability from the listing card, so the card
+            # wording is stored as is ("In stock (outgoing model)", "Arriving in stock: <date>"):
+            # a wording change is a real, visible change and cannot flip-flop between run types.
             listed_status = normalize_stock_status(item.stock_text)
             listed_quantity = parse_stock_quantity(item.stock_text)
             status_changed = listed_status != product.stock_status
-            quantity_changed = listed_quantity is not None and listed_quantity != stock_quantity
-            if status_changed or quantity_changed:
-                stock_status = listed_status
+            if status_changed or listed_quantity is not None:
                 stock_quantity = listed_quantity
-                availability_text = item.stock_text
+            stock_status = listed_status
+            availability_text = item.stock_text
 
         commerce_hash = compute_commerce_hash(
             currency=currency,
