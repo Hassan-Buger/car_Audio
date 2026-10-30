@@ -438,6 +438,8 @@ class TestStockRuns:
             ("Back order", "backorder"),
             ("Temporarily out of stock", "out_of_stock"),
             ("Discontinued product", "out_of_stock"),
+            ("Arriving in stock: 30.10.2026", "backorder"),
+            ("In stock (outgoing model)", "in_stock"),
         ],
     )
     async def test_listing_card_availability_wins_over_coarse_detail_flag(
@@ -458,6 +460,29 @@ class TestStockRuns:
         run = await make_engine(db_session).execute_stock_run()
         assert (run.updated_products, run.unchanged_products) == (0, 1)
         assert await count(db_session, ProductChange) == 1  # only the creation
+
+    @pytest.mark.asyncio
+    @respx.mock
+    async def test_wording_change_with_same_status_is_one_change_then_stable(
+        self, db_session: AsyncSession
+    ) -> None:
+        mock_catalog([A])
+        await make_engine(db_session).execute_discovery_run()
+        respx.get(ROOT).mock(
+            return_value=httpx.Response(
+                200,
+                text=listing_html(
+                    [Item("alpha-amp", "ALPHA 1", "100,00 €", "In stock (outgoing model)")],
+                    total=1,
+                ),
+            )
+        )
+        first = await make_engine(db_session).execute_stock_run()
+        second = await make_engine(db_session).execute_stock_run()
+        prod = (await db_session.execute(select(Product))).scalar_one()
+        assert (first.updated_products, second.updated_products) == (1, 0)
+        assert prod.stock_status == "in_stock"
+        assert prod.availability_text == "In stock (outgoing model)"
 
     @pytest.mark.asyncio
     @respx.mock
