@@ -26,6 +26,7 @@ def normalize_stock_status(raw_status: str | None) -> str:
         "backorder",
         "back order",
         "back-order",
+        "arriving",
         "tellimisel",
         "järeltellimus",
         "pre-order",
